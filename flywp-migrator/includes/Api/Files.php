@@ -447,7 +447,7 @@ class Files {
             );
         }
 
-        // Add files twp_delete_filo the zip
+        // Add files to the zip
         $added_files = 0;
 
         foreach ( $files as $file ) {

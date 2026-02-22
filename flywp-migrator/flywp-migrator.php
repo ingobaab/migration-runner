@@ -3,7 +3,7 @@
  * Plugin Name: FlyWP Migrator
  * Plugin URI: https://flywp.com
  * Description: Helps migrate WordPress sites to FlyWP platform
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: FlyWP
  * Text Domain: flywp-migrator
  * License: GPL-2.0+

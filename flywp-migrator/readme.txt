@@ -3,7 +3,7 @@ Contributors: flywp, tareq1988
 Tags: migration, backup, flywp, site-migration, transfer
 Requires at least: 6.0
 Tested up to: 6.7
-Stable tag: 1.2.0
+Stable tag: 1.3.0
 Requires PHP: 7.4
 License: GPL-2.0+
 License URI: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
@@ -81,6 +81,10 @@ Absolutely! We use secure transfer methods to protect your data throughout the m
 1. **Admin Interface** – Easily configure your migration settings for a seamless transfer to FlyWP.
 
 == Changelog ==
+
+= v1.3.0 (20 January, 2026) =
+
+ * **New:** Added mysqldump support for database export.
 
 = v1.2.0 (28 March, 2025) =
 

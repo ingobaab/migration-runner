@@ -1,8 +1,12 @@
 <?php
 
-namespace FlyWp\Migrator\Api;
+namespace FlyWP\Migrator\Api;
 
 use FlyWP\Migrator\Api;
+use FlyWP\Migrator\Services\Database\Backup;
+use FlyWP\Migrator\Services\Database\JobData;
+use FlyWP\Migrator\Services\Database\JobScheduler;
+use FlyWP\Migrator\Services\Database\Scheduler;
 use WP_Error;
 use WP_REST_Request;
 use WP_REST_Response;
@@ -11,332 +15,278 @@ use WP_REST_Server;
 /**
  * Database API Handler Class
  */
-class Database {
+class Database
+{
+	/**
+	 * Register database related routes
+	 *
+	 * @param string $namespace API namespace
+	 *
+	 * @return void
+	 */
+	public function register_routes( $namespace ) {
+		// Create a new dump job
+		register_rest_route(
+			$namespace,
+			'/database/dumps',
+			[
+				'methods'             => WP_REST_Server::CREATABLE,
+				'callback'            => [ $this, 'create_dump' ],
+				'permission_callback' => [ Api::class, 'check_permission' ],
+			]
+		);
 
-    /**
-     * Register database related routes
-     *
-     * @param string $namespace API namespace
-     *
-     * @return void
-     */
-    public function register_routes( $namespace ) {
-        register_rest_route(
-            $namespace,
-            '/tables',
-            [
-                'methods'             => WP_REST_Server::READABLE,
-                'callback'            => [$this, 'get_tables'],
-                'permission_callback' => [Api::class, 'check_permission'],
-            ]
-        );
+		// Get dump job status
+		register_rest_route(
+			$namespace,
+			'/database/dumps/(?P<job_id>[a-zA-Z0-9]+)',
+			[
+				'methods'             => WP_REST_Server::READABLE,
+				'callback'            => [ $this, 'get_dump_status' ],
+				'permission_callback' => [ Api::class, 'check_permission' ],
+			]
+		);
 
-        register_rest_route(
-            $namespace,
-            '/table/(?P<table>[\w-]+)/structure',
-            [
-                'methods'             => WP_REST_Server::READABLE,
-                'callback'            => [$this, 'get_table_structure'],
-                'permission_callback' => [Api::class, 'check_permission'],
-            ]
-        );
+		// Download a dump file
+		register_rest_route(
+			$namespace,
+			'/database/dumps/(?P<job_id>[a-zA-Z0-9]+)/download',
+			[
+				'methods'             => WP_REST_Server::READABLE,
+				'callback'            => [ $this, 'download_dump' ],
+				'permission_callback' => [ Api::class, 'check_permission' ],
+			]
+		);
 
-        register_rest_route(
-            $namespace,
-            '/table/(?P<table>[\w-]+)/data',
-            [
-                'methods'             => WP_REST_Server::READABLE,
-                'callback'            => [$this, 'get_table_data'],
-                'permission_callback' => [Api::class, 'check_permission'],
-                'args'                => [
-                    'offset' => [
-                        'type'              => 'integer',
-                        'required'          => true,
-                        'default'           => 0,
-                        'sanitize_callback' => 'absint',
-                    ],
-                    'limit' => [
-                        'type'              => 'integer',
-                        'required'          => true,
-                        'default'           => 1000,
-                        'sanitize_callback' => 'absint',
-                    ],
-                ],
-            ]
-        );
+		// Delete a dump job
+		register_rest_route(
+			$namespace,
+			'/database/dumps/(?P<job_id>[a-zA-Z0-9]+)',
+			[
+				'methods'             => WP_REST_Server::DELETABLE,
+				'callback'            => [ $this, 'delete_dump' ],
+				'permission_callback' => [ Api::class, 'check_permission' ],
+			]
+		);
+	}
 
-        register_rest_route(
-            $namespace,
-            '/tables/structure',
-            [
-                'methods'             => WP_REST_Server::READABLE,
-                'callback'            => [$this, 'get_all_tables_structure'],
-                'permission_callback' => [Api::class, 'check_permission'],
-            ]
-        );
-    }
+	/**
+	 * Create a new database dump (async)
+	 *
+	 * @param WP_REST_Request $request
+	 *
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function create_dump( $request ) {
+		// Create a new job
+		$jobdata = new JobData();
 
-    /**
-     * Get all tables
-     *
-     * @return WP_REST_Response
-     */
-    public function get_tables() {
-        global $wpdb;
+		// Initialize the backup job
+		$backup = new Backup( $jobdata );
+		$backup->init_job();
 
-        $tables     = $wpdb->get_col( 'SHOW TABLES' );
-        $table_info = [];
+		// Start the backup immediately (synchronously, but time-limited)
+		// First run is direct, subsequent runs via cron
+		// Set resource limits like Scheduler does
+		if ( function_exists( 'set_time_limit' ) ) {
+			@set_time_limit( 900 );
+		}
+		if ( function_exists( 'ini_set' ) ) {
+			@ini_set( 'memory_limit', '256M' );
+		}
+		if ( function_exists( 'ignore_user_abort' ) ) {
+			@ignore_user_abort( true );
+		}
 
-        foreach ( $tables as $table ) {
-            $count        = $wpdb->get_var( 'SELECT COUNT(*) FROM `' . esc_sql( $table ) . '`' );
-            $table_info[] = [
-                'count' => $count,
-                'name'  => $table,
-                'rows'  => (int) $count,
-            ];
-        }
+		// Initialize JobScheduler for this run
+		JobScheduler::set_jobdata( $jobdata, 0 );
 
-        return rest_ensure_response( [
-            'tables' => $table_info,
-            'prefix' => $wpdb->prefix,
-        ] );
-    }
+		// Update job metadata
+		$jobdata->set( 'resumption', 0 );
+		$jobdata->set( 'updated_at', time() );
 
-    /**
-     * Get table structure
-     *
-     * @param WP_REST_Request $request
-     *
-     * @return WP_REST_Response|WP_Error
-     */
-    public function get_table_structure( $request ) {
-        global $wpdb;
+		// Track when this run started
+		$runs_started = [ 0 => microtime( true ) ];
+		$jobdata->set( 'runs_started', $runs_started );
 
-        $table  = $request->get_param( 'table' );
+		// Run the first resumption directly
+		$backup->run_resumable( 0 );
 
-        if ( empty( $table ) ) {
-            return new WP_Error( 'invalid_table', __( 'Table name is required', 'flywp-migrator' ) );
-        }
+		// Return response immediately
+		return rest_ensure_response(
+			[
+				'success' => true,
+				'job_id'  => $jobdata->nonce,
+				'status'  => 'running',
+				'message' => 'Backup job started',
+			]
+		);
+	}
 
-        $structure = $wpdb->get_results( 'SHOW CREATE TABLE `' . esc_sql( $table ) . '`', ARRAY_A );
+	/**
+	 * Get dump job status
+	 *
+	 * @param WP_REST_Request $request
+	 *
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function get_dump_status( $request ) {
+		$job_id = $request->get_param( 'job_id' );
 
-        if ( empty( $structure ) ) {
-            return new WP_Error( 'invalid_table', __( 'Table not found', 'flywp-migrator' ) );
-        }
+		$jobdata = new JobData( $job_id );
+		$status  = $jobdata->get( 'status' );
 
-        $structure = $structure[0]['Create Table'];
-        $structure = str_replace( "CREATE TABLE `$table`", "DROP TABLE IF EXISTS `$table`; CREATE TABLE `$table`", $structure );
+		if ( empty( $status ) ) {
+			return new WP_Error(
+				'job_not_found',
+				'Dump job not found',
+				[ 'status' => 404 ]
+			);
+		}
 
-        return rest_ensure_response( [
-            'structure' => $structure,
-        ] );
-    }
+		$response = [
+			'job_id'   => $job_id,
+			'status'   => $status,
+			'progress' => [
+				'current_table' => $jobdata->get( 'current_table' ),
+				'table_index'   => $jobdata->get( 'current_table_index', 0 ),
+				'total_tables'  => $jobdata->get( 'total_tables', 0 ),
+			],
+			'started_at' => $jobdata->get( 'started_at' ),
+			'updated_at' => $jobdata->get( 'updated_at' ),
+		];
 
-    /**
-     * Get table data as raw SQL INSERT statement
-     *
-     * @param WP_REST_Request $request
-     *
-     * @return void Direct output of SQL
-     */
-    public function get_table_data( $request ) {
-        global $wpdb;
+		// Add resumption info if running
+		if ( 'running' === $status ) {
+			$response['resumption'] = $jobdata->get( 'resumption', 0 );
+			$resume_interval = $jobdata->get( 'resume_interval', 100 );
+			$response['resume_interval'] = $resume_interval;
+		}
 
-        // Set headers for SQL download
-        header( 'Content-Type: text/plain' );
-        header( 'X-Content-Type-Options: nosniff' );
+		// Add file info if complete
+		$file_path = $jobdata->get( 'file_path' );
+		if ( 'complete' === $status && $file_path && file_exists( $file_path ) ) {
+			$response['file']     = basename( $file_path );
+			$response['size']     = filesize( $file_path );
+			$response['download'] = rest_url( Api::NAMESPACE . '/database/dumps/' . $job_id . '/download' );
+		}
 
-        $table  = $request->get_param( 'table' );
-        $offset = (int) $request->get_param( 'offset' );
-        $limit  = (int) $request->get_param( 'limit' );
+		// Add error if failed
+		if ( 'failed' === $status ) {
+			$response['error'] = $jobdata->get( 'error' );
+		}
 
-        if ( empty( $table ) ) {
-            echo '-- Error: Table name is required';
-            exit;
-        }
+		// Trigger cron only if job is running and hasn't been updated recently
+		// This ensures stalled jobs get a kick without spamming on every poll
+		if ( 'running' === $status ) {
+			$updated_at = $jobdata->get( 'updated_at', 0 );
+			// Only trigger if not updated in the last 30 seconds
+			if ( time() - $updated_at > 30 ) {
+				Scheduler::spawn_cron();
+			}
+		}
 
-        // Get table columns
-        $columns      = $wpdb->get_results( 'DESCRIBE `' . esc_sql( $table ) . '`', ARRAY_A );
-        $column_names = [];
+		return rest_ensure_response( $response );
+	}
 
-        foreach ( $columns as $column ) {
-            $column_names[] = '`' . $column['Field'] . '`';
-        }
+	/**
+	 * Download a dump file
+	 *
+	 * @param WP_REST_Request $request
+	 *
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function download_dump( $request ) {
+		$job_id = $request->get_param( 'job_id' );
 
-        // First output a safer SQL mode
-        echo "SET SESSION sql_mode='';\n";
+		$jobdata   = new JobData( $job_id );
+		$file_path = $jobdata->get( 'file_path' );
 
-        // Start a transaction
-        echo "START TRANSACTION;\n";
+		if ( empty( $file_path ) || ! file_exists( $file_path ) ) {
+			return new WP_Error(
+				'file_not_found',
+				'Dump file not found',
+				[ 'status' => 404 ]
+			);
+		}
 
-        // Get the data with limit and offset
-        $data  = $wpdb->get_results(
-            $wpdb->prepare( 'SELECT * FROM `' . esc_sql( $table ) . '` LIMIT %d, %d', $offset, $limit ),
-            ARRAY_A
-        );
+		// Check if we should stream directly
+		$direct = $request->get_param( 'direct' );
 
-        if ( empty( $data ) ) {
-            // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
-            echo "-- No data found for table {$table}";
-            echo "\nCOMMIT;\n";
-            exit;
-        }
+		if ( $direct ) {
+			// Stream the file directly
+			$this->stream_file( $file_path );
+			exit;
+		}
 
-        // Generate values for INSERT statement
-        $all_values = [];
+		// Return file info with a download URL
+		return rest_ensure_response(
+			[
+				'success'  => true,
+				'file'     => basename( $file_path ),
+				'size'     => filesize( $file_path ),
+				'path'     => $file_path,
+				'download' => rest_url( Api::NAMESPACE . '/database/dumps/' . $job_id . '/download' ) . '?direct=1&secret=' . flywp_migrator()->get_migration_key(),
+			]
+		);
+	}
 
-        foreach ( $data as $row ) {
-            $values = [];
+	/**
+	 * Stream a file to the client
+	 *
+	 * @param string $file_path Full path to file
+	 *
+	 * @return void
+	 */
+	private function stream_file( $file_path ) {
+		$filename = basename( $file_path );
 
-            foreach ( $row as $column => $value ) {
-                $prepared_value = $this->prepare_value( $value, $column );
+		header( 'Content-Description: File Transfer' );
+		header( 'Content-Type: application/octet-stream' );
+		header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
+		header( 'Content-Transfer-Encoding: binary' );
+		header( 'Expires: 0' );
+		header( 'Cache-Control: must-revalidate' );
+		header( 'Pragma: public' );
+		header( 'Content-Length: ' . filesize( $file_path ) );
 
-                if ( is_null( $prepared_value ) ) {
-                    $values[] = 'NULL';
-                } elseif ( is_numeric( $prepared_value ) ) {
-                    $values[] = $prepared_value;
-                } else {
-                    $values[] = "'" . $prepared_value . "'";
-                }
-            }
-            $all_values[] = '(' . implode( ', ', $values ) . ')';
-        }
+		// Clean output buffer
+		if ( ob_get_level() ) {
+			ob_end_clean();
+		}
 
-        // Generate SQL in smaller chunks to avoid max packet issues
-        $chunk_size = 100; // Adjust based on typical row size
-        $chunks     = array_chunk( $all_values, $chunk_size );
+		readfile( $file_path );
+	}
 
-        foreach ( $chunks as $chunk ) {
-            // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
-            echo "INSERT IGNORE INTO `{$table}` (" . implode( ', ', $column_names ) . ') VALUES ' . implode( ",\n", $chunk ) . ";\n";
-        }
+	/**
+	 * Delete a dump job and its file
+	 *
+	 * @param WP_REST_Request $request
+	 *
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function delete_dump( $request ) {
+		$job_id = $request->get_param( 'job_id' );
 
-        // Commit the transaction
-        echo "COMMIT;\n";
-        exit;
-    }
+		$jobdata   = new JobData( $job_id );
+		$file_path = $jobdata->get( 'file_path' );
 
-    /**
-     * Prepare value with proper escaping and serialization handling
-     *
-     * @param mixed  $value  Value to prepare
-     * @param string $column Column name
-     *
-     * @return mixed Prepared value
-     */
-    private function prepare_value( $value, $column ) {
-        global $wpdb;
+		// Clear any scheduled events for this job
+		Scheduler::clear_scheduled( $job_id );
 
-        // Handle NULL values
-        if ( is_null( $value ) ) {
-            return null;
-        }
+		// Delete the file if it exists
+		if ( $file_path && file_exists( $file_path ) ) {
+			@unlink( $file_path );
+		}
 
-        // For numbers, return as is
-        if ( is_numeric( $value ) ) {
-            return $value;
-        }
+		// Delete the job data
+		$jobdata->delete_all();
 
-        // For strings, check for serialized data and fix it
-        if ( is_string( $value ) ) {
-            // Check for serialized data
-            if ( is_serialized( $value ) ) {
-                // Fix serialized data
-                $fixed_value = $this->recursively_fix_serialized_string( $value );
-                // Escape the fixed serialized data and remove placeholder
-                return $wpdb->remove_placeholder_escape(
-                    $wpdb->_real_escape( $fixed_value )
-                );
-            }
-
-            // Regular string, escape it and remove placeholder
-            return $wpdb->remove_placeholder_escape(
-                $wpdb->_real_escape( $value )
-            );
-        }
-
-        // Handle boolean values
-        if ( is_bool( $value ) ) {
-            return $value ? 1 : 0;
-        }
-
-        // Return the value as-is for other types
-        return $value;
-    }
-
-    /**
-     * Recursively fix serialized strings with multiple regex checks
-     * Inspired by Everest Backup plugin
-     *
-     * @param string $serialized Serialized data string
-     * @param int    $key        Current regex pattern index
-     *
-     * @return string Fixed serialized string
-     */
-    private function recursively_fix_serialized_string( $serialized, $key = 0 ) {
-        if ( !$serialized || !is_string( $serialized ) ) {
-            return $serialized;
-        }
-
-        // Array of regex patterns to fix serialized strings
-        $regexes = [
-            // Beaver Builder contents type compatible
-            '/(?<=^|\{|;)s:(\d+):\"(.*?)\";(?=[asbdiO]\:\d|N;|\}|$)/s',
-
-            // Elementor contents type compatible
-            '/s\:(\d+)\:\"(.*?)\";/s',
-
-            // General all-purpose final check
-            '#s:(\d+):"(.*?)";(?=\\}*(?:[aOsidbN][:;]|\\z))#s',
-        ];
-
-        if ( !isset( $regexes[$key] ) ) {
-            return $serialized;
-        }
-
-        $regex = $regexes[$key];
-
-        $fixed_string = preg_replace_callback(
-            $regex,
-            function ( $matches ) {
-                return 's:' . strlen( $matches[2] ) . ':"' . $matches[2] . '";';
-            },
-            $serialized
-        );
-
-        // If we're at the last regex, return the result
-        if ( $key === count( $regexes ) - 1 ) {
-            return $fixed_string;
-        }
-
-        // Otherwise, continue with the next regex
-        return $this->recursively_fix_serialized_string( $fixed_string, $key + 1 );
-    }
-
-    /**
-     * Get structure of all tables
-     *
-     * @return WP_REST_Response
-     */
-    public function get_all_tables_structure() {
-        global $wpdb;
-
-        $tables     = $wpdb->get_col( 'SHOW TABLES' );
-        $structures = [];
-
-        foreach ( $tables as $table ) {
-            $structure = $wpdb->get_results( 'SHOW CREATE TABLE `' . esc_sql( $table ) . '`', ARRAY_A );
-
-            if ( !empty( $structure ) ) {
-                $create_table       = $structure[0]['Create Table'];
-                $create_table       = str_replace( "CREATE TABLE `$table`", "DROP TABLE IF EXISTS `$table`; CREATE TABLE `$table`", $create_table );
-                $structures[$table] = $create_table;
-            }
-        }
-
-        return rest_ensure_response( [
-            'success'    => true,
-            'structures' => $structures,
-        ] );
-    }
+		return rest_ensure_response(
+			[
+				'success' => true,
+				'message' => 'Dump deleted successfully',
+			]
+		);
+	}
 }

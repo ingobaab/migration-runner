@@ -7,14 +7,14 @@ namespace Composer\Autoload;
 class ComposerStaticInit1c38bc6431f3dbfaefd8e4a8934dd7eb
 {
     public static $prefixLengthsPsr4 = array (
-        'F' => 
+        'F' =>
         array (
             'FlyWP\\Migrator\\' => 15,
         ),
     );
 
     public static $prefixDirsPsr4 = array (
-        'FlyWP\\Migrator\\' => 
+        'FlyWP\\Migrator\\' =>
         array (
             0 => __DIR__ . '/../..' . '/includes',
         ),
@@ -24,9 +24,16 @@ class ComposerStaticInit1c38bc6431f3dbfaefd8e4a8934dd7eb
         'Composer\\InstalledVersions' => __DIR__ . '/..' . '/composer/InstalledVersions.php',
         'FlyWP\\Migrator\\Admin' => __DIR__ . '/../..' . '/includes/Admin.php',
         'FlyWP\\Migrator\\Api' => __DIR__ . '/../..' . '/includes/Api.php',
+        'FlyWP\\Migrator\\Api\\Database' => __DIR__ . '/../..' . '/includes/Api/Database.php',
         'FlyWP\\Migrator\\Api\\Files' => __DIR__ . '/../..' . '/includes/Api/Files.php',
         'FlyWP\\Migrator\\Plugin' => __DIR__ . '/../..' . '/includes/Plugin.php',
-        'FlyWp\\Migrator\\Api\\Database' => __DIR__ . '/../..' . '/includes/Api/Database.php',
+        'FlyWP\\Migrator\\Services\\Database\\Backup' => __DIR__ . '/../..' . '/includes/Services/Database/Backup.php',
+        'FlyWP\\Migrator\\Services\\Database\\JobData' => __DIR__ . '/../..' . '/includes/Services/Database/JobData.php',
+        'FlyWP\\Migrator\\Services\\Database\\JobScheduler' => __DIR__ . '/../..' . '/includes/Services/Database/JobScheduler.php',
+        'FlyWP\\Migrator\\Services\\Database\\MysqldumpFinder' => __DIR__ . '/../..' . '/includes/Services/Database/MysqldumpFinder.php',
+        'FlyWP\\Migrator\\Services\\Database\\Scheduler' => __DIR__ . '/../..' . '/includes/Services/Database/Scheduler.php',
+        'FlyWP\\Migrator\\Services\\Database\\Semaphore' => __DIR__ . '/../..' . '/includes/Services/Database/Semaphore.php',
+        'FlyWP\\Migrator\\Services\\Database\\Utilities' => __DIR__ . '/../..' . '/includes/Services/Database/Utilities.php',
     );
 
     public static function getInitializer(ClassLoader $loader)

@@ -2,6 +2,8 @@
 
 namespace FlyWP\Migrator;
 
+use FlyWP\Migrator\Services\Database\Scheduler;
+
 /**
  * Main plugin class
  */
@@ -12,7 +14,7 @@ class Plugin {
      *
      * @var string
      */
-    const VERSION = '1.0.0';
+    const VERSION = '1.3.0';
 
     /**
      * Plugin instance
@@ -89,6 +91,9 @@ class Plugin {
      * @return void
      */
     public function init_plugin() {
+        // Initialize the backup scheduler (registers cron hooks)
+        Scheduler::init();
+
         new Admin();
     }
 

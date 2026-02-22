@@ -20,7 +20,7 @@ class MigrationPuller
         $this->logger->info("Pulling tables list");
 
         $tables = json_decode(
-            $this->client->request('GET', '/wp-json/flywp-migrator/v1/tables'),
+            $this->client->request('GET', '/wp-json/flywp-migrator/v1/tables/structure'),
             true
         );
 
