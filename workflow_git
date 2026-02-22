@@ -1,0 +1,5 @@
+# workflow in git
+git add .
+git commit -m "Message"
+git pull --rebase
+git push
