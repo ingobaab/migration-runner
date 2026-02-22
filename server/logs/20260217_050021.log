@@ -1,6 +1,0 @@
-[2026-02-17T05:00:21+00:00] [INFO] Starting OAuth
-[2026-02-17T05:01:08+00:00] [INFO] OAuth successful
-[2026-02-17T05:01:08+00:00] [INFO] Installing flywp-migrator from wordpress.org
-[2026-02-17T05:01:10+00:00] [ERROR] HTTP 401 on /wp-json/wp/v2/plugins: {"code":"rest_cannot_install_plugin","message":"Du bist leider nicht berechtigt, Plugins auf dieser Website zu installieren.","data":{"status":401}}
-[2026-02-17T05:01:13+00:00] [ERROR] HTTP 401 on /wp-json/wp/v2/plugins: {"code":"rest_cannot_install_plugin","message":"Du bist leider nicht berechtigt, Plugins auf dieser Website zu installieren.","data":{"status":401}}
-[2026-02-17T05:01:16+00:00] [ERROR] HTTP 401 on /wp-json/wp/v2/plugins: {"code":"rest_cannot_install_plugin","message":"Du bist leider nicht berechtigt, Plugins auf dieser Website zu installieren.","data":{"status":401}}

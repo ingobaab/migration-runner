@@ -32,8 +32,7 @@ $client = new WPClient(
 );
 
 $installer = new PluginInstaller($client, $logger);
-$installer->install();
-$installer->activate();
+$installer->installOrUpdateAndActivate();
 
 $puller = new MigrationPuller($client, $logger);
 

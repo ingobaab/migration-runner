@@ -16,8 +16,9 @@ $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 /**
  * Only allow /callback
  */
-if ($path !== '/callback') {
+if ($path !== '/migration-runner/server/oauth-server.php/callback') {
     http_response_code(404);
+    print_r($path);
     echo "Invalid endpoint.";
     exit;
 }
