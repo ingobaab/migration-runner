@@ -204,7 +204,7 @@ function http_request(
 
     $ch = curl_init($url);
     if ($ch === false) {
-        throw new RuntimeException('Could not initialize cURL');
+        fail('Could not initialize cURL');
     }
 
     curl_setopt_array($ch, [
