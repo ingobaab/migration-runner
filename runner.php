@@ -251,48 +251,185 @@ function http_download_to_file(
     $headers = [
         'Authorization: Basic ' . base64_encode($basicUser . ':' . $basicPass),
         'Accept: */*',
+        'Accept-Encoding: identity',
     ];
 
     foreach ($extraHeaders as $header) {
         $headers[] = $header;
     }
 
-    $fp = fopen($targetPath, 'wb');
-    if ($fp === false) {
-        fail('Could not open file for writing: ' . $targetPath);
-    }
+    $lastError = 'unknown download error';
 
-    $ch = curl_init($url);
-    if ($ch === false) {
+    for ($attempt = 1; $attempt <= 5; $attempt++) {
+        $resumeFrom = 0;
+        if (file_exists($targetPath)) {
+            $size = filesize($targetPath);
+            if (is_int($size) && $size > 0) {
+                $resumeFrom = $size;
+            }
+        }
+
+        $openMode = $resumeFrom > 0 ? 'ab' : 'wb';
+        $fp = fopen($targetPath, $openMode);
+        if ($fp === false) {
+            fail('Could not open file for writing: ' . $targetPath);
+        }
+
+        $ch = curl_init($url);
+        if ($ch === false) {
+            fclose($fp);
+            fail('Could not initialize cURL for download');
+        }
+
+        $httpVersion = $attempt >= 2 ? CURL_HTTP_VERSION_1_1 : CURL_HTTP_VERSION_NONE;
+
+        curl_setopt_array($ch, [
+            CURLOPT_FILE => $fp,
+            CURLOPT_CUSTOMREQUEST => 'GET',
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 20,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 3,
+            CURLOPT_HTTP_VERSION => $httpVersion,
+            CURLOPT_ENCODING => 'identity',
+        ]);
+
+        if ($resumeFrom > 0) {
+            curl_setopt($ch, CURLOPT_RESUME_FROM_LARGE, $resumeFrom);
+            log_line('INFO', 'Resuming partial download from byte ' . $resumeFrom . ' for: ' . $url);
+        }
+
+        $ok = curl_exec($ch);
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err = curl_error($ch);
+
+        curl_close($ch);
         fclose($fp);
-        fail('Could not initialize cURL for download');
+
+        if ($ok !== false && $httpCode < 400) {
+            return;
+        }
+
+        if ($httpCode === 416 && $resumeFrom > 0) {
+            return;
+        }
+
+        if ($ok === false) {
+            $lastError = 'Download failed: ' . $err . ' (' . $url . ')';
+        } else {
+            $lastError = 'Download failed with HTTP ' . $httpCode . ' (' . $url . ')';
+        }
+
+        $canResume = $ok === false && str_contains(strtolower($err), 'bytes missing');
+        if (!$canResume) {
+            @unlink($targetPath);
+        }
+
+        if ($attempt < 5) {
+            log_line('INFO', 'Retrying download attempt ' . ($attempt + 1) . '/5 for: ' . $url);
+            sleep(min($attempt, 3));
+            continue;
+        }
     }
 
-    curl_setopt_array($ch, [
-        CURLOPT_FILE => $fp,
-        CURLOPT_CUSTOMREQUEST => 'GET',
-        CURLOPT_HTTPHEADER => $headers,
-        CURLOPT_TIMEOUT => $timeout,
-        CURLOPT_CONNECTTIMEOUT => 20,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 3,
-    ]);
+    fail($lastError);
+}
 
-    $ok = curl_exec($ch);
-    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $err = curl_error($ch);
-
-    curl_close($ch);
-    fclose($fp);
-
-    if ($ok === false) {
-        @unlink($targetPath);
-        fail('Download failed: ' . $err . ' (' . $url . ')');
+function read_text_file(string $path): string
+{
+    $raw = file_get_contents($path);
+    if ($raw === false) {
+        fail('Could not read file: ' . $path);
     }
 
-    if ($httpCode >= 400) {
-        @unlink($targetPath);
-        fail('Download failed with HTTP ' . $httpCode . ' (' . $url . ')');
+    return $raw;
+}
+
+function decode_downloaded_json_file(string $path): ?array
+{
+    if (!file_exists($path)) {
+        return null;
+    }
+
+    $size = filesize($path);
+    if (!is_int($size) || $size < 2 || $size > 1024 * 1024) {
+        return null;
+    }
+
+    $raw = read_text_file($path);
+    $trimmed = ltrim($raw);
+    if ($trimmed === '' || ($trimmed[0] !== '{' && $trimmed[0] !== '[')) {
+        return null;
+    }
+
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) {
+        return null;
+    }
+
+    return $decoded;
+}
+
+function download_db_dump_with_direct_fallback(
+    string $initialUrl,
+    string $targetPath,
+    string $basicUser,
+    string $basicPass,
+    string $key,
+    string $siteUrl
+): void {
+    $url = $initialUrl;
+    $seenUrls = [];
+
+    for ($attempt = 1; $attempt <= 5; $attempt++) {
+        http_download_to_file($url, $targetPath, $basicUser, $basicPass, ['X-FlyWP-Key: ' . $key], 1800);
+
+        $jsonBody = decode_downloaded_json_file($targetPath);
+        if ($jsonBody === null) {
+            return;
+        }
+
+        $nextDownloadUrl = '';
+        if (isset($jsonBody['download']) && is_string($jsonBody['download']) && $jsonBody['download'] !== '') {
+            $nextDownloadUrl = $jsonBody['download'];
+        }
+
+        if ($nextDownloadUrl !== '') {
+            if (isset($seenUrls[$nextDownloadUrl])) {
+                log_line('INFO', 'DB dump metadata repeated the same download URL, trying direct uploads path fallback');
+                break;
+            }
+
+            $seenUrls[$nextDownloadUrl] = true;
+            log_line('INFO', 'DB dump download returned metadata JSON, retrying with nested direct URL');
+            $url = $nextDownloadUrl;
+            continue;
+        }
+
+        break;
+    }
+
+    $jsonBody = decode_downloaded_json_file($targetPath);
+    if (!is_array($jsonBody)) {
+        fail('DB dump download failed: expected SQL/GZIP but got an unknown response.');
+    }
+
+    $fileName = '';
+    if (isset($jsonBody['file']) && is_string($jsonBody['file']) && $jsonBody['file'] !== '') {
+        $fileName = basename($jsonBody['file']);
+    }
+
+    if ($fileName === '') {
+        fail('DB dump download returned JSON metadata instead of SQL/GZIP and did not provide a valid file name.');
+    }
+
+    $publicUploadsUrl = rtrim($siteUrl, '/') . '/wp-content/uploads/flywp-migrator/' . rawurlencode($fileName);
+    log_line('INFO', 'Trying DB dump fallback URL: ' . $publicUploadsUrl);
+    http_download_to_file($publicUploadsUrl, $targetPath, $basicUser, $basicPass, ['X-FlyWP-Key: ' . $key], 1800);
+
+    if (decode_downloaded_json_file($targetPath) !== null) {
+        fail('DB dump download kept returning JSON metadata; binary dump could not be fetched.');
     }
 }
 
@@ -542,7 +679,7 @@ function run_cli_workflow(array $cfg): void
     $jobId = $job['job_id'];
 
     $dbStatusPath = $domainDir . '/db-status.json';
-    $dbDumpPath = $domainDir . '/db-dump.sql';
+    $dbDumpFilename = 'db-dump.sql.gz';
 
     $dbComplete = false;
     $waitStart = time();
@@ -578,12 +715,18 @@ function run_cli_workflow(array $cfg): void
         $downloadUrl = $meta['download'];
     }
 
+    if (isset($meta['file']) && is_string($meta['file']) && $meta['file'] !== '') {
+        $dbDumpFilename = basename($meta['file']);
+    }
+
+    $dbDumpPath = $domainDir . '/' . $dbDumpFilename;
+
     if ($downloadUrl === '') {
         fail('No download URL returned for DB dump');
     }
 
     log_line('INFO', 'Downloading database dump');
-    http_download_to_file($downloadUrl, $dbDumpPath, $userLogin, $appPassword, ['X-FlyWP-Key: ' . $migrationKey], 1800);
+    download_db_dump_with_direct_fallback($downloadUrl, $dbDumpPath, $userLogin, $appPassword, $migrationKey, $siteUrl);
 
     log_line('INFO', 'Fetching uploads manifest');
     $manifestResp = http_request(
