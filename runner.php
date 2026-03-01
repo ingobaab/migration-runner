@@ -281,7 +281,9 @@ function http_download_to_file(
             fail('Could not initialize cURL for download');
         }
 
-        $httpVersion = $attempt >= 2 ? CURL_HTTP_VERSION_1_1 : CURL_HTTP_VERSION_NONE;
+        $httpVersion = $attempt >= 2 && defined('CURL_HTTP_VERSION_1_1')
+            ? CURL_HTTP_VERSION_1_1
+            : (defined('CURL_HTTP_VERSION_NONE') ? CURL_HTTP_VERSION_NONE : 0);
 
         curl_setopt_array($ch, [
             CURLOPT_FILE => $fp,
@@ -296,7 +298,14 @@ function http_download_to_file(
         ]);
 
         if ($resumeFrom > 0) {
-            curl_setopt($ch, CURLOPT_RESUME_FROM_LARGE, $resumeFrom);
+            if (defined('CURLOPT_RESUME_FROM_LARGE')) {
+                curl_setopt($ch, CURLOPT_RESUME_FROM_LARGE, $resumeFrom);
+            } elseif (defined('CURLOPT_RESUME_FROM')) {
+                curl_setopt($ch, CURLOPT_RESUME_FROM, (int)$resumeFrom);
+            } else {
+                $headers[] = 'Range: bytes=' . $resumeFrom . '-';
+                curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+            }
             log_line('INFO', 'Resuming partial download from byte ' . $resumeFrom . ' for: ' . $url);
         }
 
