@@ -1,473 +1,155 @@
-Architecture – FlyWP Migration Runner
-1. Ziel des Systems
+# Migration Runner Architektur (gefroren)
 
-Dieses System implementiert einen serverseitig gestarteten Migration Runner, der:
+## Freeze / Leitplanken
 
-Ein Quell-WordPress autorisiert
+1. **Das WordPress-Plugin `flywp-migrator` bleibt unverändert.**
+2. Runner arbeitet **nur gegen die aktuelle Plugin-API** mit `/database/dumps`.
+3. Kein Importer: nur Pull/Transfer und lokale Speicherung.
+4. Implementierungsstil Runner: **eine Datei (`runner.php`)**, prozedural, KISS, leicht testbar.
 
-Das Plugin flywp-migrator automatisch installiert
+---
 
-Das Plugin aktiviert
+## Zielbild
 
-Die Migration vollständig per Pull durchführt
+Der Runner startet serverseitig, erhält über WordPress Application Passwords Zugriff und zieht anschließend vollständig die exportierbaren Artefakte:
 
-Alle Artefakte lokal speichert
+- Metadaten (`info`, optional `verify`) als JSON
+- Datenbankdump (Job-basiert über `/database/dumps`)
+- Uploads chunkweise
+- `plugins.zip`, `themes.zip`, `mu-plugins.zip`
 
-Keinen Import durchführt
+Ablage erfolgt lokal in einem Domain-Ordner:
 
-Keine Ziel-WordPress-Instanz benötigt
+```text
+exports/<domain>/
+  credentials.json
+  info.json
+  verify.json
+  db-status.json
+  db-download-meta.json
+  db-dump.sql
+  plugins.zip
+  themes.zip
+  mu-plugins.zip
+  uploads/
+    uploads_chunk_00000.zip
+    ...
+  run-summary.json
+```
 
-Der Runner ist:
+---
 
-CLI-basiert
+## Authentifizierung und Endpunkte
 
-Ohne eigene WordPress-Installation
+### 1) Application Password Flow
 
-Ohne offenen HTTP-Receiver
+- Benutzer wird zu `/wp-admin/authorize-application.php` geführt.
+- WordPress liefert per Redirect `site_url`, `user_login`, `password` zurück an `runner.php` (HTTP-Callback-Modus).
+- Runner speichert diese Daten in `credentials.json`.
 
-Deterministisch
+### 2) Plugin Install/Update/Aktivierung
 
-Einmalig pro Run
+Über Core WP REST API:
 
-2. Grundarchitektur
-High-Level Ablauf
-CLI Runner
-    │
-    ├─ OAuth (Application Password Flow)
-    │
-    ├─ REST Plugin Install (wordpress.org slug)
-    │
-    ├─ REST Plugin Activate
-    │
-    ├─ Pull DB (chunked)
-    │
-    ├─ Pull Files (ZIP)
-    │
-    └─ Store Artifacts
+- `POST /wp-json/wp/v2/plugins` mit `{"slug":"flywp-migrator"}`
+- `POST /wp-json/wp/v2/plugins/flywp-migrator/flywp-migrator` mit `{"update":true}` (falls installiert)
+- `POST /wp-json/wp/v2/plugins/flywp-migrator/flywp-migrator` mit `{"status":"active"}`
 
+### 3) `info` und `verify` – Rolle und Reihenfolge
 
-Es gibt keinen Push-Receiver.
+#### `GET /wp-json/flywp-migrator/v1/info`
 
-Die Architektur ist vollständig Pull-basiert.
+- Für den App-Password-authentifizierten Kontext.
+- Liefert Site- und Runtime-Metadaten inkl. Migration Key.
+- **Primärer Einstiegspunkt nach Plugin-Aktivierung.**
 
-3. Authentifizierungsmodell
-Verwendet wird
+#### `POST /wp-json/flywp-migrator/v1/verify` mit `key`
 
-WordPress Application Passwords
+- Validiert einen bereits bekannten Migration Key.
+- Ist ein zusätzlicher Konsistenzcheck.
+- **Empfohlene Reihenfolge:**
+  1. Erst `info` holen (Key erhalten)
+  2. Dann optional `verify` mit genau diesem Key
 
-Kein:
+### 4) Migration-Key für weitere Endpunkte
 
-OAuth2
+Für DB- und Datei-Endpunkte wird der Key gesetzt als:
 
-JWT
+- Header `X-FlyWP-Key: <key>`
+- optional zusätzlich als Query `?secret=<key>`
 
-HMAC
+---
 
-Custom Token
+## Ablauf (verbindlich)
 
-Ablauf
+1. CLI-Start: `php runner.php --source=... --callback-url=...`
+2. OAuth-URL ausgeben, auf Callback warten.
+3. `credentials.json` schreiben.
+4. Plugin installieren/aktualisieren/aktivieren.
+5. `info` abrufen und als `info.json` speichern.
+6. `verify` optional ausführen und `verify.json` speichern.
+7. DB-Export:
+   - `POST /database/dumps`
+   - `GET /database/dumps/{job_id}` pollen bis `complete` oder `failed`
+   - `GET /database/dumps/{job_id}/download` (Meta)
+   - binären Dump laden (`direct=1` URL aus Meta)
+   - optional `DELETE /database/dumps/{job_id}`
+8. Uploads:
+   - `GET /uploads/manifest`
+   - pro Chunk `GET /uploads/download?chunk=n`
+9. Nicht-chunked Downloads:
+   - `GET /plugins/download`
+   - `GET /themes/download`
+   - `GET /mu-plugins/download`
+10. `run-summary.json` schreiben.
 
-Redirect zu:
+---
 
-/wp-admin/authorize-application.php
+## Effizienz / Chunking-Bewertung
 
+### Chunked
 
-Admin bestätigt
+- **Uploads:** manifestbasiert und in Chunks aufgeteilt (100MB Zielgröße pro Chunk).
+- **DB:** jobbasiert asynchron mit Polling (keine alten table/offset-Endpunkte).
 
-WordPress erzeugt Application Password
+### Nicht chunked
 
-Redirect mit:
+- `plugins`, `themes`, `mu-plugins` werden jeweils als einzelnes ZIP übertragen.
 
-site_url
-user_login
-password
+### Gesamtbewertung
 
+- Für große Uploads und große DB robust und praktikabel.
+- Bei sehr großen Plugin-/Theme-Bäumen können Einzel-ZIPs größere Lastspitzen erzeugen.
+- Für KISS-Runner und unverändertes Plugin ist das akzeptabel.
 
-Runner speichert Credentials
+---
 
-Alle REST Calls erfolgen via:
+## Implementierungsregeln für `runner.php`
 
-Authorization: Basic base64(user_login:application_password)
+1. Eine Datei, prozedural, keine OOP-Hierarchie.
+2. Explizite Fehlerbehandlung, klare Exit-Codes.
+3. Jede API-Antwort validieren (HTTP-Status + JSON-Struktur).
+4. Keine stillen Fallbacks bei Sicherheitsparametern.
+5. Migration Key nicht in Logs ausgeben.
+6. Artefakte deterministisch pro Domain ablegen.
+7. Keine Importlogik implementieren.
+8. Keine Plugin-Änderung.
 
-Wichtige Erkenntnisse
+---
 
-Application Password wird nur einmal im Klartext übertragen
+## Teststrategie (später gegen externes WordPress)
 
-Danach nur gehasht in DB gespeichert
+1. Runner hosten, sodass `--callback-url` öffentlich erreichbar ist.
+2. Testlauf mit echter Quelle starten.
+3. Prüfen:
+   - OAuth callback angekommen
+   - Plugin installiert/aktiv
+   - `info.json` und `verify.json` plausibel
+   - DB-Job läuft bis `complete`
+   - alle ZIPs vorhanden
+   - Upload-Chunks vollständig und fortlaufend nummeriert
+4. Integritätschecks lokal:
+   - ZIP-Validität (`unzip -t`)
+   - Dateigrößen > 0 (wo erwartet)
+   - JSON-Dateien syntaktisch valide
 
-Volle Admin-Rechte möglich
-
-Revocable im WordPress Backend
-
-Kein zusätzlicher Auth-Layer notwendig
-
-4. Automatische Plugin-Installation
-
-Nach erfolgreicher Autorisierung:
-
-POST /wp-json/wp/v2/plugins
-{
-  "slug": "flywp-migrator"
-}
-
-
-WordPress:
-
-Kontaktiert api.wordpress.org
-
-Lädt offizielles ZIP
-
-Installiert Plugin
-
-Prüft Signaturen
-
-Nutzt Plugin_Upgrader
-
-Anschließend:
-
-POST /wp-json/wp/v2/plugins/flywp-migrator/flywp-migrator
-{
-  "status": "active"
-}
-
-Wichtige technische Findings
-
-REST Install nutzt keinen AJAX-Skin
-
-Kein Redirect
-
-Keine JS-Abhängigkeit
-
-Installation erfolgt vollständig serverseitig
-
-Erfordert:
-
-DISALLOW_FILE_MODS = false
-
-Schreibrechte auf wp-content/plugins
-
-FS_METHOD = direct oder korrektes FTP Setup
-
-5. Analyse des unveränderten flywp-migrator Plugins
-
-Das Plugin ist ein reiner Exporter.
-
-Es:
-
-Registriert REST Endpunkte
-
-Nutzt permission_callback
-
-Nutzt WordPress Capability-System
-
-Erzeugt SQL-Dumps tabellenweise
-
-Unterstützt Chunked Table Data
-
-Erzeugt ZIPs für:
-
-Plugins
-
-Themes
-
-Uploads
-
-MU-Plugins
-
-Arbeitet ohne Shell (kein mysqldump)
-
-Nutzt WP_Filesystem API
-
-REST Namespace
-/wp-json/flywp-migrator/v1/
-
-Relevante Endpoints
-/verify
-/tables
-/table/{table}/structure
-/table/{table}/data
-/uploads/manifest
-/uploads/download
-/plugins/download
-/themes/download
-/mu-plugins/download
-
-Wichtige Architektur-Eigenschaften
-
-Chunked DB Pull
-
-Kein Server-Push
-
-Pull-basiertes Design
-
-Keine eigene Auth-Implementierung
-
-Vertraut vollständig auf WordPress Auth
-
-Sicherheitsbewertung
-
-Positiv:
-
-Kein Shell Execution
-
-Kein unsicherer SQL Input
-
-Capability Checks vorhanden
-
-WP Filesystem korrekt genutzt
-
-Zu beachten:
-
-Application Password gibt vollständige Admin-Rechte
-
-Kein Rate Limiting im Plugin selbst
-
-Zugriff ist vollständig, sobald Auth erfolgreich ist
-
-6. Server-seitiger Migration Runner
-Eigenschaften
-
-CLI-only
-
-Kein dauerhafter HTTP-Server
-
-Kein WordPress erforderlich
-
-Kein Push-Receiver
-
-Keine offene Angriffsfläche
-
-Kein Locking notwendig
-
-Kein Reset-Mechanismus erforderlich
-
-Komponenten
-OAuthFlow
-WPClient
-PluginInstaller
-MigrationPuller
-Logger
-Retry
-
-7. Migration Pull – Datenbank
-
-Ablauf:
-
-/tables
-
-Für jede Tabelle:
-
-/structure
-
-/data?offset=0
-
-/data?offset=1000
-
-fortlaufend bis leer
-
-Ergebnis:
-
-artifacts/{timestamp}/database.sql
-
-
-Eigenschaften:
-
-Deterministisch
-
-Reproduzierbar
-
-Kein Direkt-Import
-
-Chunk-resistent
-
-Kein Shell-Zugriff
-
-8. Migration Pull – Filesystem
-
-Es werden gezogen:
-
-/plugins/download
-
-/themes/download
-
-/uploads/download
-
-/mu-plugins/download
-
-Ergebnis:
-
-artifacts/{timestamp}/plugins.zip
-artifacts/{timestamp}/themes.zip
-artifacts/{timestamp}/uploads.zip
-
-9. Logging & Retry
-Logging
-
-Zeitgestempelt
-
-In /logs
-
-INFO / ERROR Level
-
-HTTP Statuscodes werden protokolliert
-
-cURL Fehler werden geloggt
-
-Retry
-
-Maximal 3 Versuche
-
-2 Sekunden Abstand
-
-Behandelt:
-
-cURL Fehler
-
-HTTP >= 400
-
-10. Fehlerdiagnose bei Plugin-Install
-
-Typische Fehlerquellen:
-
-HTTP 500 bei /wp-json/wp/v2/plugins
-
-Mögliche Ursachen:
-
-DISALLOW_FILE_MODS = true
-
-Container keine Schreibrechte
-
-WordPress kann api.wordpress.org nicht erreichen
-
-DNS im Container blockiert
-
-PHP Zip Extension fehlt
-
-OpenSSL fehlt
-
-HTTP 401
-
-Falsches Application Password
-
-User keine install_plugins Capability
-
-HTTP 403
-
-REST blockiert
-
-Security Plugin aktiv
-
-IP Restriction
-
-11. Warum CLI und kein HTTP Receiver
-
-Ein HTTP-Receiver würde:
-
-Angriffsfläche öffnen
-
-Eigenes Auth-Handling benötigen
-
-Lock-Management benötigen
-
-Timeout-Handling benötigen
-
-Cleanup-Strategie benötigen
-
-CLI ist:
-
-Einmaliger Prozess
-
-Deterministisch
-
-Kein dauerhaft offener Port
-
-Kein Reset-Mechanismus nötig
-
-Kein zusätzlicher Sicherheitslayer
-
-12. Sicherheitsbewertung Gesamtsystem
-Positiv
-
-Keine dauerhafte offene API
-
-Keine Custom Auth
-
-WordPress Core Security genutzt
-
-Keine Push-Endpoints
-
-Keine Shell-Ausführung
-
-Kein root-Zwang technisch notwendig
-
-Minimaler Angriffsvektor
-
-Kritisch
-
-Application Password ist Admin-Level
-
-Muss sicher gespeichert werden
-
-HTTPS zwingend
-
-Logs dürfen Passwort nicht enthalten
-
-Keine parallelen Migrationen ohne zusätzliche Isolation
-
-13. Bewusst nicht implementiert
-
-Import der Daten
-
-Resume bei Abbruch
-
-Parallel Pull
-
-Rate Limiting
-
-Artifact Signing
-
-SHA256 Validierung
-
-Disk Quota Checks
-
-Partial Migration
-
-14. Gesamtbewertung
-
-Das System ist:
-
-Klar getrennt
-
-Pull-basiert
-
-Deterministisch
-
-Minimale Angriffsfläche
-
-Keine WordPress-Abhängigkeit auf Zielseite
-
-Kompatibel mit unverändertem flywp-migrator Plugin
-
-Produktionsnah erweiterbar
-
-15. Finaler Status
-
-Das implementierte System:
-
-Startet serverseitig
-
-Führt OAuth korrekt aus
-
-Installiert Plugin von wordpress.org
-
-Aktiviert Plugin
-
-Zieht vollständige Migration
-
-Speichert Artefakte lokal
-
-Loggt sauber
-
-Nutzt Retry-Mechanismus
-
-Benötigt kein dauerhaftes HTTP-Interface
