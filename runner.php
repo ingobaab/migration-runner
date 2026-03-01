@@ -251,6 +251,7 @@ function http_download_to_file(
     $headers = [
         'Authorization: Basic ' . base64_encode($basicUser . ':' . $basicPass),
         'Accept: */*',
+        'Accept-Encoding: identity',
     ];
 
     foreach ($extraHeaders as $header) {
