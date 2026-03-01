@@ -129,6 +129,9 @@ Für DB- und Datei-Endpunkte wird der Key gesetzt als:
 - Binärdownloads werden mit `.part`-Dateien geschrieben und erst nach Erfolg atomar umbenannt.
 - Chunk-/ZIP-/DB-Downloads laufen mit Retry (mehrere Versuche mit Wartezeit).
 
+- DB-Dump wird ausschließlich über den `download`-Link aus der DB-Meta geladen, wobei der Runner `direct=1` erzwingt (sonst liefert der Endpoint JSON-Metadaten statt Binärinhalt).
+- Standard-Zieldatei ist `db-dump.sql.gz`; falls die API einen konkreten Dateinamen liefert, wird dieser verwendet.
+
 ---
 
 ## Implementierungsregeln für `runner.php`

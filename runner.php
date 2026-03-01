@@ -470,6 +470,80 @@ function download_binary_endpoint(
     }, $attempts, $sleepSeconds);
 }
 
+
+function normalize_db_download_url(string $url, string $key): string
+{
+    $parts = parse_url($url);
+    if ($parts === false) {
+        fail('Invalid DB download URL: ' . $url);
+    }
+
+    $query = [];
+    if (isset($parts['query']) && is_string($parts['query']) && $parts['query'] !== '') {
+        parse_str($parts['query'], $query);
+    }
+
+    $query['direct'] = '1';
+    if (!isset($query['secret']) || (string)$query['secret'] === '') {
+        $query['secret'] = $key;
+    }
+
+    $rebuilt = '';
+    if (isset($parts['scheme'])) {
+        $rebuilt .= $parts['scheme'] . '://';
+    }
+    if (isset($parts['user'])) {
+        $rebuilt .= $parts['user'];
+        if (isset($parts['pass'])) {
+            $rebuilt .= ':' . $parts['pass'];
+        }
+        $rebuilt .= '@';
+    }
+    if (isset($parts['host'])) {
+        $rebuilt .= $parts['host'];
+    }
+    if (isset($parts['port'])) {
+        $rebuilt .= ':' . $parts['port'];
+    }
+    $rebuilt .= $parts['path'] ?? '';
+
+    $queryString = http_build_query($query);
+    if ($queryString !== '') {
+        $rebuilt .= '?' . $queryString;
+    }
+    if (isset($parts['fragment'])) {
+        $rebuilt .= '#' . $parts['fragment'];
+    }
+
+    return $rebuilt;
+}
+
+function validate_db_dump_payload(string $path): void
+{
+    $fh = fopen($path, 'rb');
+    if ($fh === false) {
+        fail('Could not open DB dump file for validation: ' . $path);
+    }
+
+    $head = fread($fh, 256);
+    fclose($fh);
+
+    if ($head === false) {
+        fail('Could not read DB dump file header: ' . $path);
+    }
+
+    $trimmed = ltrim($head);
+    if ($trimmed !== '' && $trimmed[0] === '{') {
+        $all = file_get_contents($path);
+        if (is_string($all)) {
+            $decoded = json_decode($all, true);
+            if (is_array($decoded)) {
+                fail('DB dump download returned JSON instead of SQL/GZIP. Check direct=1 URL handling.');
+            }
+        }
+    }
+}
+
 function run_cli_workflow(array $cfg): void
 {
     $source = $cfg['source'];
@@ -558,7 +632,7 @@ function run_cli_workflow(array $cfg): void
     $jobId = $job['job_id'];
 
     $dbStatusPath = $domainDir . '/db-status.json';
-    $dbDumpPath = $domainDir . '/db-dump.sql';
+    $dbDumpPath = $domainDir . '/db-dump.sql.gz';
 
     $dbComplete = false;
     $waitStart = time();
@@ -598,8 +672,17 @@ function run_cli_workflow(array $cfg): void
         fail('No download URL returned for DB dump');
     }
 
-    log_line('INFO', 'Downloading database dump');
+    $downloadUrl = normalize_db_download_url($downloadUrl, $migrationKey);
+
+    $dbDumpFilename = 'db-dump.sql.gz';
+    if (isset($meta['file']) && is_string($meta['file']) && preg_match('/\.sql(\.gz)?$/', $meta['file']) === 1) {
+        $dbDumpFilename = $meta['file'];
+    }
+    $dbDumpPath = $domainDir . '/' . $dbDumpFilename;
+
+    log_line('INFO', 'Downloading database dump from direct URL');
     download_binary_endpoint('', $downloadUrl, $dbDumpPath, $userLogin, $appPassword, $migrationKey, 5, 3, 3600);
+    validate_db_dump_payload($dbDumpPath);
 
     log_line('INFO', 'Fetching uploads manifest');
     $manifestResp = http_request(
