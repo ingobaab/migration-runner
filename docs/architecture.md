@@ -163,3 +163,34 @@ Für DB- und Datei-Endpunkte wird der Key gesetzt als:
    - Dateigrößen > 0 (wo erwartet)
    - JSON-Dateien syntaktisch valide
 
+---
+
+## Implementierungsregeln für `runner.php`
+
+1. Eine Datei, prozedural, keine OOP-Hierarchie.
+2. Explizite Fehlerbehandlung, klare Exit-Codes.
+3. Jede API-Antwort validieren (HTTP-Status + JSON-Struktur).
+4. Keine stillen Fallbacks bei Sicherheitsparametern.
+5. Migration Key nicht in Logs ausgeben.
+6. Artefakte deterministisch pro Domain ablegen.
+7. Keine Importlogik implementieren.
+8. Keine Plugin-Änderung.
+
+---
+
+## Teststrategie (später gegen externes WordPress)
+
+1. Runner hosten, sodass `--callback-url` öffentlich erreichbar ist.
+2. Testlauf mit echter Quelle starten.
+3. Prüfen:
+   - OAuth callback angekommen
+   - Plugin installiert/aktiv
+   - `info.json` und `verify.json` plausibel
+   - DB-Job läuft bis `complete`
+   - alle ZIPs vorhanden
+   - Upload-Chunks vollständig und fortlaufend nummeriert
+4. Integritätschecks lokal:
+   - ZIP-Validität (`unzip -t`)
+   - Dateigrößen > 0 (wo erwartet)
+   - JSON-Dateien syntaktisch valide
+
