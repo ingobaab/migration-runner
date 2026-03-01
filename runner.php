@@ -215,12 +215,13 @@ function http_request(
         CURLOPT_CONNECTTIMEOUT => 20,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_MAXREDIRS => 3,
+        CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
     ]);
 
     if ($jsonBody !== null) {
         $payload = json_encode($jsonBody);
         if ($payload === false) {
-            fail('Could not encode request JSON for ' . $url);
+            throw new RuntimeException('Could not encode request JSON for ' . $url);
         }
         curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
     }
@@ -231,7 +232,7 @@ function http_request(
     curl_close($ch);
 
     if ($responseBody === false) {
-        fail('HTTP request failed: ' . $error . ' (' . $url . ')');
+        throw new RuntimeException('HTTP request failed: ' . $error . ' (' . $url . ')');
     }
 
     return [
@@ -257,15 +258,17 @@ function http_download_to_file(
         $headers[] = $header;
     }
 
-    $fp = fopen($targetPath, 'wb');
+    $tmpPath = $targetPath . '.part';
+    $fp = fopen($tmpPath, 'wb');
     if ($fp === false) {
-        fail('Could not open file for writing: ' . $targetPath);
+        throw new RuntimeException('Could not open file for writing: ' . $tmpPath);
     }
 
     $ch = curl_init($url);
     if ($ch === false) {
         fclose($fp);
-        fail('Could not initialize cURL for download');
+        @unlink($tmpPath);
+        throw new RuntimeException('Could not initialize cURL for download');
     }
 
     curl_setopt_array($ch, [
@@ -276,6 +279,7 @@ function http_download_to_file(
         CURLOPT_CONNECTTIMEOUT => 20,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_MAXREDIRS => 3,
+        CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
     ]);
 
     $ok = curl_exec($ch);
@@ -286,13 +290,18 @@ function http_download_to_file(
     fclose($fp);
 
     if ($ok === false) {
-        @unlink($targetPath);
-        fail('Download failed: ' . $err . ' (' . $url . ')');
+        @unlink($tmpPath);
+        throw new RuntimeException('Download failed: ' . $err . ' (' . $url . ')');
     }
 
     if ($httpCode >= 400) {
-        @unlink($targetPath);
-        fail('Download failed with HTTP ' . $httpCode . ' (' . $url . ')');
+        @unlink($tmpPath);
+        throw new RuntimeException('Download failed with HTTP ' . $httpCode . ' (' . $url . ')');
+    }
+
+    if (!rename($tmpPath, $targetPath)) {
+        @unlink($tmpPath);
+        throw new RuntimeException('Could not finalize download file: ' . $targetPath);
     }
 }
 
@@ -448,10 +457,91 @@ function download_binary_endpoint(
     string $targetPath,
     string $user,
     string $pass,
-    string $key
+    string $key,
+    int $attempts = 5,
+    int $sleepSeconds = 3,
+    int $timeout = 1800
 ): void {
-    $url = $base . $endpointWithQuery;
-    http_download_to_file($url, $targetPath, $user, $pass, ['X-FlyWP-Key: ' . $key]);
+    $url = $base === '' ? $endpointWithQuery : $base . $endpointWithQuery;
+
+    request_with_retry(function () use ($url, $targetPath, $user, $pass, $key, $timeout) {
+        http_download_to_file($url, $targetPath, $user, $pass, ['X-FlyWP-Key: ' . $key], $timeout);
+        return true;
+    }, $attempts, $sleepSeconds);
+}
+
+
+function normalize_db_download_url(string $url, string $key): string
+{
+    $parts = parse_url($url);
+    if ($parts === false) {
+        fail('Invalid DB download URL: ' . $url);
+    }
+
+    $query = [];
+    if (isset($parts['query']) && is_string($parts['query']) && $parts['query'] !== '') {
+        parse_str($parts['query'], $query);
+    }
+
+    $query['direct'] = '1';
+    if (!isset($query['secret']) || (string)$query['secret'] === '') {
+        $query['secret'] = $key;
+    }
+
+    $rebuilt = '';
+    if (isset($parts['scheme'])) {
+        $rebuilt .= $parts['scheme'] . '://';
+    }
+    if (isset($parts['user'])) {
+        $rebuilt .= $parts['user'];
+        if (isset($parts['pass'])) {
+            $rebuilt .= ':' . $parts['pass'];
+        }
+        $rebuilt .= '@';
+    }
+    if (isset($parts['host'])) {
+        $rebuilt .= $parts['host'];
+    }
+    if (isset($parts['port'])) {
+        $rebuilt .= ':' . $parts['port'];
+    }
+    $rebuilt .= $parts['path'] ?? '';
+
+    $queryString = http_build_query($query);
+    if ($queryString !== '') {
+        $rebuilt .= '?' . $queryString;
+    }
+    if (isset($parts['fragment'])) {
+        $rebuilt .= '#' . $parts['fragment'];
+    }
+
+    return $rebuilt;
+}
+
+function validate_db_dump_payload(string $path): void
+{
+    $fh = fopen($path, 'rb');
+    if ($fh === false) {
+        fail('Could not open DB dump file for validation: ' . $path);
+    }
+
+    $head = fread($fh, 256);
+    fclose($fh);
+
+    if ($head === false) {
+        fail('Could not read DB dump file header: ' . $path);
+    }
+
+    $trimmed = ltrim($head);
+    if ($trimmed !== '' && $trimmed[0] === '{') {
+        $all = file_get_contents($path);
+        if (is_string($all)) {
+            $decoded = json_decode($all, true);
+            if (is_array($decoded)) {
+                fail('DB dump download returned JSON instead of SQL/GZIP. Check direct=1 URL handling.');
+            }
+        }
+    }
 }
 
 function run_cli_workflow(array $cfg): void
@@ -542,7 +632,7 @@ function run_cli_workflow(array $cfg): void
     $jobId = $job['job_id'];
 
     $dbStatusPath = $domainDir . '/db-status.json';
-    $dbDumpPath = $domainDir . '/db-dump.sql';
+    $dbDumpPath = $domainDir . '/db-dump.sql.gz';
 
     $dbComplete = false;
     $waitStart = time();
@@ -582,8 +672,17 @@ function run_cli_workflow(array $cfg): void
         fail('No download URL returned for DB dump');
     }
 
-    log_line('INFO', 'Downloading database dump');
-    http_download_to_file($downloadUrl, $dbDumpPath, $userLogin, $appPassword, ['X-FlyWP-Key: ' . $migrationKey], 1800);
+    $downloadUrl = normalize_db_download_url($downloadUrl, $migrationKey);
+
+    $dbDumpFilename = 'db-dump.sql.gz';
+    if (isset($meta['file']) && is_string($meta['file']) && preg_match('/\.sql(\.gz)?$/', $meta['file']) === 1) {
+        $dbDumpFilename = $meta['file'];
+    }
+    $dbDumpPath = $domainDir . '/' . $dbDumpFilename;
+
+    log_line('INFO', 'Downloading database dump from direct URL');
+    download_binary_endpoint('', $downloadUrl, $dbDumpPath, $userLogin, $appPassword, $migrationKey, 5, 3, 3600);
+    validate_db_dump_payload($dbDumpPath);
 
     log_line('INFO', 'Fetching uploads manifest');
     $manifestResp = http_request(
@@ -654,6 +753,8 @@ function run_cli_workflow(array $cfg): void
         'host_directory' => $domainDir,
         'job_id' => $jobId,
         'uploads_chunks' => $totalChunks,
+        'http_version' => '1.1',
+        'download_retry_attempts' => 5,
         'completed_at' => date('c'),
     ]);
 

@@ -122,6 +122,85 @@ Für DB- und Datei-Endpunkte wird der Key gesetzt als:
 - Bei sehr großen Plugin-/Theme-Bäumen können Einzel-ZIPs größere Lastspitzen erzeugen.
 - Für KISS-Runner und unverändertes Plugin ist das akzeptabel.
 
+
+### Transport-Robustheit
+
+- Runner erzwingt für Requests/Downloads `HTTP/1.1` (statt HTTP/2), um bekannte Stream-Abbrüche bei großen Binärtransfers zu umgehen.
+- Binärdownloads werden mit `.part`-Dateien geschrieben und erst nach Erfolg atomar umbenannt.
+- Chunk-/ZIP-/DB-Downloads laufen mit Retry (mehrere Versuche mit Wartezeit).
+
+- DB-Dump wird ausschließlich über den `download`-Link aus der DB-Meta geladen, wobei der Runner `direct=1` erzwingt (sonst liefert der Endpoint JSON-Metadaten statt Binärinhalt).
+- Standard-Zieldatei ist `db-dump.sql.gz`; falls die API einen konkreten Dateinamen liefert, wird dieser verwendet.
+
+---
+
+## Implementierungsregeln für `runner.php`
+
+1. Eine Datei, prozedural, keine OOP-Hierarchie.
+2. Explizite Fehlerbehandlung, klare Exit-Codes.
+3. Jede API-Antwort validieren (HTTP-Status + JSON-Struktur).
+4. Keine stillen Fallbacks bei Sicherheitsparametern.
+5. Migration Key nicht in Logs ausgeben.
+6. Artefakte deterministisch pro Domain ablegen.
+7. Keine Importlogik implementieren.
+8. Keine Plugin-Änderung.
+
+---
+
+## Teststrategie (später gegen externes WordPress)
+
+1. Runner hosten, sodass `--callback-url` öffentlich erreichbar ist.
+2. Testlauf mit echter Quelle starten.
+3. Prüfen:
+   - OAuth callback angekommen
+   - Plugin installiert/aktiv
+   - `info.json` und `verify.json` plausibel
+   - DB-Job läuft bis `complete`
+   - alle ZIPs vorhanden
+   - Upload-Chunks vollständig und fortlaufend nummeriert
+4. Integritätschecks lokal:
+   - ZIP-Validität (`unzip -t`)
+   - Dateigrößen > 0 (wo erwartet)
+   - JSON-Dateien syntaktisch valide
+
+
+
+---
+
+
+## Re-Test (praktischer Ablauf)
+
+Für einen echten End-to-End-Test (mit öffentlicher Callback-URL):
+
+```bash
+php runner.php   --source=https://maschenmarie.de   --callback-url=https://migrate.baab.de/migration-runner/runner.php   --export-dir=exports
+```
+
+Danach Integritätschecks lokal:
+
+```bash
+# DB-Dump darf kein JSON sein
+head -c 120 exports/maschenmarie.de/db-dump.sql.gz
+
+# GZip muss valide sein
+gzip -t exports/maschenmarie.de/db-dump.sql.gz
+
+# Optional: ersten SQL-Inhalt ansehen
+zcat exports/maschenmarie.de/db-dump.sql.gz | head -n 20
+
+# ZIP-Artefakte prüfen
+unzip -t exports/maschenmarie.de/plugins.zip
+unzip -t exports/maschenmarie.de/themes.zip
+unzip -t exports/maschenmarie.de/mu-plugins.zip
+
+# Upload-Chunks prüfen
+for f in exports/maschenmarie.de/uploads/*.zip; do unzip -t "$f" >/dev/null || echo "BAD: $f"; done
+```
+
+Erwartung:
+- `db-dump.sql.gz` ist binär/gzip, nicht JSON.
+- `gzip -t` gibt Exit-Code 0.
+- ZIP-Tests laufen ohne Fehler durch.
 ---
 
 ## Implementierungsregeln für `runner.php`
