@@ -296,6 +296,78 @@ function http_download_to_file(
     }
 }
 
+function read_text_file(string $path): string
+{
+    $raw = file_get_contents($path);
+    if ($raw === false) {
+        fail('Could not read file: ' . $path);
+    }
+
+    return $raw;
+}
+
+function decode_downloaded_json_file(string $path): ?array
+{
+    if (!file_exists($path)) {
+        return null;
+    }
+
+    $size = filesize($path);
+    if (!is_int($size) || $size < 2 || $size > 1024 * 1024) {
+        return null;
+    }
+
+    $raw = read_text_file($path);
+    $trimmed = ltrim($raw);
+    if ($trimmed === '' || ($trimmed[0] !== '{' && $trimmed[0] !== '[')) {
+        return null;
+    }
+
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) {
+        return null;
+    }
+
+    return $decoded;
+}
+
+function download_db_dump_with_direct_fallback(
+    string $initialUrl,
+    string $targetPath,
+    string $basicUser,
+    string $basicPass,
+    string $key
+): void {
+    $url = $initialUrl;
+
+    for ($attempt = 1; $attempt <= 3; $attempt++) {
+        http_download_to_file($url, $targetPath, $basicUser, $basicPass, ['X-FlyWP-Key: ' . $key], 1800);
+
+        $jsonBody = decode_downloaded_json_file($targetPath);
+        if ($jsonBody === null) {
+            return;
+        }
+
+        $nextDownloadUrl = '';
+        if (isset($jsonBody['download']) && is_string($jsonBody['download']) && $jsonBody['download'] !== '') {
+            $nextDownloadUrl = $jsonBody['download'];
+        }
+
+        if ($nextDownloadUrl === '') {
+            fail('DB dump download returned JSON instead of SQL/GZIP and did not provide a follow-up download URL.');
+        }
+
+        if ($attempt === 3) {
+            fail('DB dump download kept returning JSON metadata instead of SQL/GZIP after multiple attempts.');
+        }
+
+        log_line('INFO', 'DB dump download returned metadata JSON, retrying with nested direct URL');
+        $url = $nextDownloadUrl;
+    }
+
+    fail('Unexpected DB dump download state');
+}
+
 function require_json_success(array $response, string $context): array
 {
     if ($response['status'] >= 400) {
@@ -542,7 +614,7 @@ function run_cli_workflow(array $cfg): void
     $jobId = $job['job_id'];
 
     $dbStatusPath = $domainDir . '/db-status.json';
-    $dbDumpPath = $domainDir . '/db-dump.sql';
+    $dbDumpFilename = 'db-dump.sql.gz';
 
     $dbComplete = false;
     $waitStart = time();
@@ -578,12 +650,18 @@ function run_cli_workflow(array $cfg): void
         $downloadUrl = $meta['download'];
     }
 
+    if (isset($meta['file']) && is_string($meta['file']) && $meta['file'] !== '') {
+        $dbDumpFilename = basename($meta['file']);
+    }
+
+    $dbDumpPath = $domainDir . '/' . $dbDumpFilename;
+
     if ($downloadUrl === '') {
         fail('No download URL returned for DB dump');
     }
 
     log_line('INFO', 'Downloading database dump');
-    http_download_to_file($downloadUrl, $dbDumpPath, $userLogin, $appPassword, ['X-FlyWP-Key: ' . $migrationKey], 1800);
+    download_db_dump_with_direct_fallback($downloadUrl, $dbDumpPath, $userLogin, $appPassword, $migrationKey);
 
     log_line('INFO', 'Fetching uploads manifest');
     $manifestResp = http_request(
